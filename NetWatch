@@ -1,0 +1,514 @@
+#!/usr/bin/env python3
+"""
+NetWatch - Network Packet Analyzer & Traffic Monitor
+Author: Aman
+Version: 1.0.0
+"""
+
+import argparse
+import socket
+import struct
+import sys
+import time
+import os
+import json
+import signal
+from collections import defaultdict
+from datetime import datetime
+from threading import Thread, Event
+
+# ─────────────────────────────────────────────
+#  ANSI COLOR CODES
+# ─────────────────────────────────────────────
+class Color:
+    RESET   = "\033[0m"
+    BOLD    = "\033[1m"
+    RED     = "\033[91m"
+    GREEN   = "\033[92m"
+    YELLOW  = "\033[93m"
+    BLUE    = "\033[94m"
+    MAGENTA = "\033[95m"
+    CYAN    = "\033[96m"
+    WHITE   = "\033[97m"
+    DIM     = "\033[2m"
+
+# ─────────────────────────────────────────────
+#  PROTOCOL MAPS
+# ─────────────────────────────────────────────
+PROTO_MAP = {
+    1:  ("ICMP", Color.CYAN),
+    6:  ("TCP",  Color.GREEN),
+    17: ("UDP",  Color.YELLOW),
+    47: ("GRE",  Color.MAGENTA),
+    50: ("ESP",  Color.RED),
+    89: ("OSPF", Color.BLUE),
+}
+
+PORT_SERVICES = {
+    20: "FTP-data", 21: "FTP", 22: "SSH", 23: "Telnet",
+    25: "SMTP", 53: "DNS", 67: "DHCP", 68: "DHCP",
+    80: "HTTP", 110: "POP3", 143: "IMAP", 443: "HTTPS",
+    445: "SMB", 3306: "MySQL", 3389: "RDP", 5432: "PostgreSQL",
+    6379: "Redis", 8080: "HTTP-Alt", 8443: "HTTPS-Alt",
+    27017: "MongoDB",
+}
+
+SUSPICIOUS_PORTS = {22, 23, 3389, 445, 135, 139, 4444, 1337, 31337, 6666, 9001}
+
+# ─────────────────────────────────────────────
+#  PACKET PARSER
+# ─────────────────────────────────────────────
+class PacketParser:
+    @staticmethod
+    def parse_ethernet(raw):
+        """Parse Ethernet frame (Linux raw socket)."""
+        if len(raw) < 14:
+            return None
+        dest_mac = PacketParser._format_mac(raw[0:6])
+        src_mac  = PacketParser._format_mac(raw[6:12])
+        proto    = struct.unpack("!H", raw[12:14])[0]
+        return {"dest_mac": dest_mac, "src_mac": src_mac, "proto": proto, "payload": raw[14:]}
+
+    @staticmethod
+    def parse_ip(raw):
+        """Parse IPv4 header."""
+        if len(raw) < 20:
+            return None
+        ihl    = (raw[0] & 0xF) * 4
+        proto  = raw[9]
+        src_ip = socket.inet_ntoa(raw[12:16])
+        dst_ip = socket.inet_ntoa(raw[16:20])
+        ttl    = raw[8]
+        length = struct.unpack("!H", raw[2:4])[0]
+        return {
+            "ihl": ihl, "proto": proto, "src_ip": src_ip,
+            "dst_ip": dst_ip, "ttl": ttl, "length": length,
+            "payload": raw[ihl:]
+        }
+
+    @staticmethod
+    def parse_tcp(raw):
+        """Parse TCP segment."""
+        if len(raw) < 20:
+            return None
+        src_port, dst_port, seq, ack = struct.unpack("!HHII", raw[0:12])
+        offset = ((raw[12] >> 4) * 4)
+        flags  = raw[13]
+        flags_str = PacketParser._tcp_flags(flags)
+        return {
+            "src_port": src_port, "dst_port": dst_port,
+            "seq": seq, "ack": ack, "flags": flags_str,
+            "payload": raw[offset:]
+        }
+
+    @staticmethod
+    def parse_udp(raw):
+        """Parse UDP datagram."""
+        if len(raw) < 8:
+            return None
+        src_port, dst_port, length = struct.unpack("!HHH", raw[0:6])
+        return {
+            "src_port": src_port, "dst_port": dst_port,
+            "length": length, "payload": raw[8:]
+        }
+
+    @staticmethod
+    def parse_icmp(raw):
+        """Parse ICMP message."""
+        if len(raw) < 4:
+            return None
+        icmp_type = raw[0]
+        icmp_code = raw[1]
+        type_map = {0: "Echo Reply", 3: "Dest Unreachable",
+                    8: "Echo Request", 11: "Time Exceeded"}
+        return {
+            "type": icmp_type, "code": icmp_code,
+            "type_name": type_map.get(icmp_type, f"Type {icmp_type}")
+        }
+
+    @staticmethod
+    def _format_mac(raw):
+        return ":".join(f"{b:02x}" for b in raw)
+
+    @staticmethod
+    def _tcp_flags(f):
+        flags = []
+        if f & 0x01: flags.append("FIN")
+        if f & 0x02: flags.append("SYN")
+        if f & 0x04: flags.append("RST")
+        if f & 0x08: flags.append("PSH")
+        if f & 0x10: flags.append("ACK")
+        if f & 0x20: flags.append("URG")
+        return "|".join(flags) if flags else "NONE"
+
+
+# ─────────────────────────────────────────────
+#  STATISTICS TRACKER
+# ─────────────────────────────────────────────
+class Stats:
+    def __init__(self):
+        self.total_packets  = 0
+        self.total_bytes    = 0
+        self.proto_counts   = defaultdict(int)
+        self.ip_counts      = defaultdict(int)
+        self.port_counts    = defaultdict(int)
+        self.alerts         = []
+        self.start_time     = time.time()
+        self.flagged_ips    = set()
+
+    def record(self, proto_name, src_ip, dst_ip, size, src_port=None, dst_port=None):
+        self.total_packets += 1
+        self.total_bytes   += size
+        self.proto_counts[proto_name] += 1
+        self.ip_counts[src_ip] += 1
+        if src_port: self.port_counts[src_port] += 1
+        if dst_port: self.port_counts[dst_port] += 1
+
+    def add_alert(self, msg):
+        ts = datetime.now().strftime("%H:%M:%S")
+        self.alerts.append(f"[{ts}] {msg}")
+
+    def elapsed(self):
+        return time.time() - self.start_time
+
+    def pps(self):
+        e = self.elapsed()
+        return self.total_packets / e if e > 0 else 0
+
+    def bps(self):
+        e = self.elapsed()
+        return (self.total_bytes * 8) / e if e > 0 else 0
+
+
+# ─────────────────────────────────────────────
+#  DISPLAY HELPERS
+# ─────────────────────────────────────────────
+def banner():
+    print(f"""
+{Color.CYAN}{Color.BOLD}
+ ███╗   ██╗███████╗████████╗██╗    ██╗ █████╗ ████████╗ ██████╗██╗  ██╗
+ ████╗  ██║██╔════╝╚══██╔══╝██║    ██║██╔══██╗╚══██╔══╝██╔════╝██║  ██║
+ ██╔██╗ ██║█████╗     ██║   ██║ █╗ ██║███████║   ██║   ██║     ███████║
+ ██║╚██╗██║██╔══╝     ██║   ██║███╗██║██╔══██║   ██║   ██║     ██╔══██║
+ ██║ ╚████║███████╗   ██║   ╚███╔███╔╝██║  ██║   ██║   ╚██████╗██║  ██║
+ ╚═╝  ╚═══╝╚══════╝   ╚═╝    ╚══╝╚══╝ ╚═╝  ╚═╝   ╚═╝    ╚═════╝╚═╝  ╚═╝
+{Color.RESET}{Color.DIM}  Network Packet Analyzer & Traffic Monitor  |  v1.0.0{Color.RESET}
+""")
+
+def separator(char="─", width=72, color=Color.DIM):
+    print(f"{color}{char * width}{Color.RESET}")
+
+def print_packet(proto_name, proto_color, src_ip, dst_ip, size, extra="", alert=False):
+    ts    = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+    alert_tag = f" {Color.RED}[!ALERT]{Color.RESET}" if alert else ""
+    print(
+        f"{Color.DIM}{ts}{Color.RESET}  "
+        f"{proto_color}{proto_name:<5}{Color.RESET}  "
+        f"{Color.WHITE}{src_ip:<18}{Color.RESET}"
+        f"{Color.DIM}→{Color.RESET}  "
+        f"{Color.WHITE}{dst_ip:<18}{Color.RESET}  "
+        f"{Color.DIM}{size:>6} B{Color.RESET}  "
+        f"{Color.DIM}{extra}{Color.RESET}"
+        f"{alert_tag}"
+    )
+
+def print_stats(stats: Stats):
+    separator("═")
+    print(f"\n{Color.BOLD}{Color.CYAN}  📊  SESSION STATISTICS{Color.RESET}\n")
+    print(f"  {'Elapsed':20} {stats.elapsed():.1f}s")
+    print(f"  {'Total Packets':20} {stats.total_packets:,}")
+    print(f"  {'Total Data':20} {_human_bytes(stats.total_bytes)}")
+    print(f"  {'Avg Rate':20} {stats.pps():.1f} pps  /  {_human_bits(stats.bps())}")
+
+    print(f"\n{Color.BOLD}  Protocol Breakdown:{Color.RESET}")
+    for proto, count in sorted(stats.proto_counts.items(), key=lambda x: -x[1]):
+        pct = (count / stats.total_packets * 100) if stats.total_packets else 0
+        bar = "█" * int(pct / 5)
+        print(f"    {proto:<8} {count:>6}  {Color.GREEN}{bar:<20}{Color.RESET}  {pct:.1f}%")
+
+    print(f"\n{Color.BOLD}  Top Talkers (src IPs):{Color.RESET}")
+    top_ips = sorted(stats.ip_counts.items(), key=lambda x: -x[1])[:5]
+    for ip, count in top_ips:
+        print(f"    {ip:<20} {count:>6} pkts")
+
+    print(f"\n{Color.BOLD}  Top Ports:{Color.RESET}")
+    top_ports = sorted(stats.port_counts.items(), key=lambda x: -x[1])[:5]
+    for port, count in top_ports:
+        svc = PORT_SERVICES.get(port, "")
+        print(f"    {port:<8} {svc:<14} {count:>6} pkts")
+
+    if stats.alerts:
+        print(f"\n{Color.BOLD}{Color.RED}  ⚠  ALERTS ({len(stats.alerts)}):{Color.RESET}")
+        for alert in stats.alerts[-10:]:
+            print(f"    {Color.RED}{alert}{Color.RESET}")
+
+    separator("═")
+
+def _human_bytes(n):
+    for unit in ["B", "KB", "MB", "GB"]:
+        if n < 1024: return f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} TB"
+
+def _human_bits(n):
+    for unit in ["bps", "Kbps", "Mbps", "Gbps"]:
+        if n < 1000: return f"{n:.1f} {unit}"
+        n /= 1000
+    return f"{n:.1f} Tbps"
+
+
+# ─────────────────────────────────────────────
+#  THREAT DETECTOR
+# ─────────────────────────────────────────────
+class ThreatDetector:
+    def __init__(self, stats: Stats, threshold_pps=200):
+        self.stats          = stats
+        self.threshold_pps  = threshold_pps
+        self._syn_tracker   = defaultdict(int)   # ip → SYN count per window
+        self._icmp_tracker  = defaultdict(int)
+        self._window_start  = time.time()
+        self._window_sec    = 5
+
+    def _reset_window(self):
+        now = time.time()
+        if now - self._window_start > self._window_sec:
+            self._syn_tracker.clear()
+            self._icmp_tracker.clear()
+            self._window_start = now
+
+    def check(self, ip_info, transport_info, proto_name):
+        self._reset_window()
+        src = ip_info["src_ip"]
+        alerts = []
+
+        # SYN Flood detection
+        if proto_name == "TCP" and transport_info:
+            if "SYN" in transport_info.get("flags", "") and "ACK" not in transport_info.get("flags", ""):
+                self._syn_tracker[src] += 1
+                if self._syn_tracker[src] > 50:
+                    alerts.append(f"SYN FLOOD from {src} ({self._syn_tracker[src]} SYNs/{self._window_sec}s)")
+                    self.stats.flagged_ips.add(src)
+
+        # ICMP flood detection
+        if proto_name == "ICMP":
+            self._icmp_tracker[src] += 1
+            if self._icmp_tracker[src] > 30:
+                alerts.append(f"ICMP FLOOD from {src} ({self._icmp_tracker[src]} pings/{self._window_sec}s)")
+                self.stats.flagged_ips.add(src)
+
+        # Suspicious destination ports
+        if transport_info:
+            dst_port = transport_info.get("dst_port", 0)
+            if dst_port in SUSPICIOUS_PORTS and src not in self.stats.flagged_ips:
+                alerts.append(f"Suspicious port {dst_port} ({PORT_SERVICES.get(dst_port, '?')}) from {src}")
+                self.stats.flagged_ips.add(src)
+
+        # Telnet / unencrypted protocol warning
+        if transport_info:
+            dst_port = transport_info.get("dst_port", 0)
+            if dst_port == 23:
+                alerts.append(f"TELNET (cleartext) connection from {src}")
+
+        for a in alerts:
+            self.stats.add_alert(a)
+
+        return len(alerts) > 0
+
+
+# ─────────────────────────────────────────────
+#  CORE SNIFFER
+# ─────────────────────────────────────────────
+class NetWatch:
+    def __init__(self, args):
+        self.args      = args
+        self.stats     = Stats()
+        self.detector  = ThreatDetector(self.stats)
+        self.stop_evt  = Event()
+        self.logfile   = None
+        self.pkt_count = 0
+
+        if args.log:
+            self.logfile = open(args.log, "w")
+            self.logfile.write("timestamp,proto,src_ip,src_port,dst_ip,dst_port,size,flags\n")
+
+    def _log(self, row: dict):
+        if self.logfile:
+            self.logfile.write(
+                f"{datetime.now().isoformat()},{row.get('proto','')},{row.get('src_ip','')},"
+                f"{row.get('src_port','')} ,{row.get('dst_ip','')},{row.get('dst_port','')},"
+                f"{row.get('size',0)},{row.get('flags','')}\n"
+            )
+
+    def _match_filter(self, proto_name, src_ip, dst_ip, src_port=None, dst_port=None):
+        a = self.args
+        if a.proto and proto_name.lower() != a.proto.lower():
+            return False
+        if a.host and a.host not in (src_ip, dst_ip):
+            return False
+        if a.port:
+            if a.port not in (src_port, dst_port):
+                return False
+        return True
+
+    def start(self):
+        try:
+            # AF_PACKET = Linux raw socket at L2 (requires root)
+            sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(0x0800))
+        except PermissionError:
+            print(f"{Color.RED}[!] Root privileges required. Run with sudo.{Color.RESET}")
+            sys.exit(1)
+        except OSError as e:
+            print(f"{Color.RED}[!] Socket error: {e}{Color.RESET}")
+            sys.exit(1)
+
+        if self.args.iface:
+            try:
+                sock.bind((self.args.iface, 0))
+            except OSError as e:
+                print(f"{Color.RED}[!] Cannot bind to {self.args.iface}: {e}{Color.RESET}")
+                sys.exit(1)
+
+        banner()
+        iface_name = self.args.iface or "all interfaces"
+        print(f"  {Color.GREEN}●{Color.RESET} Listening on {Color.BOLD}{iface_name}{Color.RESET}")
+        if self.args.proto: print(f"  {Color.DIM}Filter: proto={self.args.proto}{Color.RESET}")
+        if self.args.host:  print(f"  {Color.DIM}Filter: host={self.args.host}{Color.RESET}")
+        if self.args.port:  print(f"  {Color.DIM}Filter: port={self.args.port}{Color.RESET}")
+        if self.args.count: print(f"  {Color.DIM}Capture limit: {self.args.count} packets{Color.RESET}")
+        if self.args.log:   print(f"  {Color.DIM}Logging to: {self.args.log}{Color.RESET}")
+        print()
+        separator()
+        print(f"  {Color.DIM}{'TIME':13} {'PROTO':<6} {'SRC':^18} {'':^3} {'DST':^18} {'SIZE':>7}  INFO{Color.RESET}")
+        separator()
+
+        # Stats thread
+        if self.args.stats_interval:
+            stats_thread = Thread(target=self._stats_loop, daemon=True)
+            stats_thread.start()
+
+        try:
+            while not self.stop_evt.is_set():
+                raw_data, _ = sock.recvfrom(65536)
+                self._process(raw_data)
+
+                if self.args.count and self.pkt_count >= self.args.count:
+                    break
+        except KeyboardInterrupt:
+            pass
+        finally:
+            sock.close()
+            if self.logfile:
+                self.logfile.close()
+            print()
+            print_stats(self.stats)
+
+    def _process(self, raw):
+        eth = PacketParser.parse_ethernet(raw)
+        if not eth or eth["proto"] != 0x0800:
+            return
+
+        ip = PacketParser.parse_ip(eth["payload"])
+        if not ip:
+            return
+
+        proto_num  = ip["proto"]
+        proto_name, proto_color = PROTO_MAP.get(proto_num, (f"IP/{proto_num}", Color.WHITE))
+        src_ip, dst_ip = ip["src_ip"], ip["dst_ip"]
+        size       = ip["length"]
+        transport  = None
+        extra      = ""
+        src_port   = dst_port = None
+
+        if proto_num == 6:   # TCP
+            transport = PacketParser.parse_tcp(ip["payload"])
+            if transport:
+                src_port = transport["src_port"]
+                dst_port = transport["dst_port"]
+                src_svc  = PORT_SERVICES.get(src_port, "")
+                dst_svc  = PORT_SERVICES.get(dst_port, "")
+                extra = (
+                    f"{src_port}{'('+src_svc+')' if src_svc else ''}→"
+                    f"{dst_port}{'('+dst_svc+')' if dst_svc else ''}  "
+                    f"[{transport['flags']}]"
+                )
+
+        elif proto_num == 17:  # UDP
+            transport = PacketParser.parse_udp(ip["payload"])
+            if transport:
+                src_port = transport["src_port"]
+                dst_port = transport["dst_port"]
+                src_svc  = PORT_SERVICES.get(src_port, "")
+                dst_svc  = PORT_SERVICES.get(dst_port, "")
+                extra = (
+                    f"{src_port}{'('+src_svc+')' if src_svc else ''}→"
+                    f"{dst_port}{'('+dst_svc+')' if dst_svc else ''}"
+                )
+
+        elif proto_num == 1:   # ICMP
+            transport = PacketParser.parse_icmp(ip["payload"])
+            if transport:
+                extra = transport["type_name"]
+
+        if not self._match_filter(proto_name, src_ip, dst_ip, src_port, dst_port):
+            return
+
+        is_alert = self.detector.check(ip, transport, proto_name)
+        self.stats.record(proto_name, src_ip, dst_ip, size, src_port, dst_port)
+        self.pkt_count += 1
+
+        if not self.args.quiet:
+            print_packet(proto_name, proto_color, src_ip, dst_ip, size, extra, alert=is_alert)
+
+        self._log({
+            "proto": proto_name, "src_ip": src_ip, "src_port": src_port,
+            "dst_ip": dst_ip, "dst_port": dst_port, "size": size,
+            "flags": transport.get("flags", "") if transport else ""
+        })
+
+    def _stats_loop(self):
+        while not self.stop_evt.is_set():
+            time.sleep(self.args.stats_interval)
+            print()
+            print_stats(self.stats)
+            print()
+
+
+# ─────────────────────────────────────────────
+#  CLI ENTRY
+# ─────────────────────────────────────────────
+def parse_args():
+    p = argparse.ArgumentParser(
+        prog="netwatch",
+        description="NetWatch — Network Packet Analyzer & Traffic Monitor",
+        formatter_class=argparse.RawTextHelpFormatter,
+        epilog="""
+Examples:
+  sudo python3 netwatch.py                        # Capture all traffic
+  sudo python3 netwatch.py -i eth0               # Specific interface
+  sudo python3 netwatch.py -p tcp                # TCP only
+  sudo python3 netwatch.py --host 192.168.1.1    # Filter by host
+  sudo python3 netwatch.py --port 443            # HTTPS traffic
+  sudo python3 netwatch.py -c 100 -l capture.csv # Capture 100 pkts, log to CSV
+  sudo python3 netwatch.py --stats 10            # Print stats every 10s
+  sudo python3 netwatch.py -q --stats 5          # Silent mode, stats only
+"""
+    )
+    p.add_argument("-i", "--iface",          metavar="INTERFACE",  help="Network interface (e.g. eth0, wlan0)")
+    p.add_argument("-p", "--proto",          metavar="PROTO",      help="Filter by protocol: tcp, udp, icmp")
+    p.add_argument("--host",                 metavar="IP",         help="Filter by source or destination IP")
+    p.add_argument("--port",  type=int,      metavar="PORT",       help="Filter by port number")
+    p.add_argument("-c", "--count", type=int,metavar="N",          help="Stop after N packets")
+    p.add_argument("-l", "--log",            metavar="FILE",       help="Save capture to CSV file")
+    p.add_argument("--stats", type=int,      dest="stats_interval",metavar="SEC", help="Print stats every N seconds")
+    p.add_argument("-q", "--quiet",          action="store_true",  help="Suppress per-packet output")
+    p.add_argument("-v", "--version",        action="version",     version="NetWatch 1.0.0")
+    return p.parse_args()
+
+def main():
+    args = parse_args()
+    signal.signal(signal.SIGTERM, lambda s, f: sys.exit(0))
+    nw = NetWatch(args)
+    nw.start()
+
+if __name__ == "__main__":
+    main()
