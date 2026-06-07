@@ -1,10 +1,10 @@
-# 🛡️ NetWatch — Network Packet Analyzer & Traffic Monitor
+#  NetWatch — Network Packet Analyzer & Traffic Monitor
 
 > A Python-based CLI tool for real-time network packet capture, protocol dissection, traffic analysis, and basic intrusion detection.
 
 ---
 
-## 📸 What It Does
+##  What It Does
 
 NetWatch captures raw network packets directly from the wire, dissects them at the Ethernet → IP → Transport layers, and gives you a clean, color-coded live feed in your terminal. It also silently watches for threat patterns (SYN floods, ICMP floods, suspicious ports) and alerts you inline.
 
@@ -21,7 +21,7 @@ NetWatch captures raw network packets directly from the wire, dissects them at t
 
 ---
 
-## ⚙️ Features
+##  Features
 
 | Feature | Description |
 |---|---|
@@ -37,7 +37,7 @@ NetWatch captures raw network packets directly from the wire, dissects them at t
 
 ---
 
-## 🚀 Quick Start
+##  Quick Start
 
 ### Requirements
 
@@ -57,7 +57,7 @@ No `pip install` needed — NetWatch uses only Python's standard library.
 
 ---
 
-## 📖 Usage
+##  Usage
 
 ```bash
 sudo python3 netwatch.py [OPTIONS]
@@ -79,7 +79,7 @@ sudo python3 netwatch.py [OPTIONS]
 
 ---
 
-## 💡 Examples
+##  Examples
 
 ```bash
 # Capture everything on all interfaces
@@ -109,7 +109,7 @@ sudo python3 netwatch.py -p tcp --host 10.0.0.1 -c 500 -l suspicious.csv
 
 ---
 
-## 🔍 How It Works
+##  How It Works
 
 ### Packet Capture Flow
 
@@ -147,7 +147,7 @@ Detected threats are flagged inline with `[!ALERT]` and summarized in the sessio
 
 ---
 
-## 📊 Session Statistics
+##  Session Statistics
 
 Press `Ctrl+C` at any time (or use `--stats N`) to see:
 
@@ -160,7 +160,7 @@ Press `Ctrl+C` at any time (or use `--stats N`) to see:
 
 ---
 
-## 📁 CSV Log Format
+##  CSV Log Format
 
 When logging with `-l file.csv`, each row contains:
 
@@ -178,7 +178,7 @@ CSV output can be analyzed with Python, Excel, Wireshark (import), or any SIEM.
 
 ---
 
-## 🧠 Architecture
+##  Architecture
 
 ```
 netwatch.py
@@ -192,7 +192,7 @@ netwatch.py
 
 ---
 
-## 🔐 Security Notes
+##  Security Notes
 
 - NetWatch **requires root** because raw socket access (`AF_PACKET`) is a privileged operation. This is standard for any packet sniffer.
 - Only use on networks you own or have explicit authorization to monitor. Unauthorized packet capture may violate laws in your jurisdiction.
@@ -200,7 +200,7 @@ netwatch.py
 
 ---
 
-## 🗺️ Roadmap / Possible Extensions
+##  Roadmap / Possible Extensions
 
 - [ ] IPv6 support
 - [ ] ARP spoofing detection
@@ -214,13 +214,13 @@ netwatch.py
 
 ---
 
-## 👤 Author
+##  Author
 
 **Aman** — B.Tech CSE (Cybersecurity)  
 Built as a portfolio project demonstrating: raw socket programming, protocol dissection, real-time anomaly detection, and CLI tool design.
 
 ---
 
-## 📜 License
+##  License
 
 MIT License — free to use, modify, and distribute with attribution.
